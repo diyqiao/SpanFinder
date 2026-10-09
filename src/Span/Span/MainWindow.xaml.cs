@@ -72,6 +72,7 @@ namespace Span
         private const int SW_SHOW = 5;
 
         private IntPtr _hwnd;
+        private Helpers.Win32DropTarget? _nativeDropTarget; // classic OLE IDropTarget for WeChat CF_HDROP (Issue #73)
         private SUBCLASSPROC? _subclassProc; // prevent GC collection
         private DispatcherTimer? _deviceChangeDebounceTimer;
         private DispatcherTimer? _drivePollingTimer;
@@ -583,6 +584,19 @@ namespace Span
             // Get HWND early (needed by child views and context menu service)
             _hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
 
+            // Issue #73: WinUI 3's XAML drop pipeline can't map WeChat 4.x's delayed
+            // CF_HDROP to StorageItems, so external image drags are silently rejected.
+            // Register a classic Win32 OLE IDropTarget on the top-level HWND to capture
+            // the drop directly and extract the real file paths.
+            try
+            {
+                _nativeDropTarget = Helpers.Win32DropTarget.Register(_hwnd, OnNativeExternalDrop);
+            }
+            catch (Exception ex)
+            {
+                Helpers.DebugLogger.Log($"[MainWindow] Native drop target registration failed: {ex.Message}");
+            }
+
             // Increment app launch count for Store rating prompt
             _settings.AppLaunchCount++;
 
@@ -592,15 +606,26 @@ namespace Span
             // Window icon (shown in taskbar & title bar)
             try
             {
+                string? iconPath = null;
+                try
+                {
 #pragma warning disable CA1416 // Platform compatibility (guarded by try-catch)
-                var iconPath = System.IO.Path.Combine(
-                    Windows.ApplicationModel.Package.Current.InstalledPath,
-                    "Assets", "app.ico");
+                    iconPath = System.IO.Path.Combine(
+                        Windows.ApplicationModel.Package.Current.InstalledPath,
+                        "Assets", "app.ico");
 #pragma warning restore CA1416
-                if (System.IO.File.Exists(iconPath))
+                }
+                catch
+                {
+                    iconPath = System.IO.Path.Combine(AppContext.BaseDirectory, "Assets", "app.ico");
+                }
+
+                if (!string.IsNullOrEmpty(iconPath) && System.IO.File.Exists(iconPath))
+                {
                     this.AppWindow.SetIcon(iconPath);
+                }
             }
-            catch { /* unpackaged mode — icon set by manifest */ }
+            catch { }
 
             // Pass context menu service and HWND to child views
             _contextMenuService.OwnerHwnd = _hwnd;
@@ -1340,6 +1365,9 @@ namespace Span
 
                 // STEP 0: Block all queued DispatcherQueue callbacks and async continuations
                 _isClosed = true;
+
+                // Revoke the native OLE drop target so OLE stops calling into us.
+                try { _nativeDropTarget?.Dispose(); _nativeDropTarget = null; } catch { }
 
                 // STEP 0.1: 드래그 타이머 즉시 중지 (타이머 콜백이 teardown 중 UI 접근 방지)
                 try { _tearOffDragTimer?.Stop(); _tearOffDragTimer = null; } catch { }

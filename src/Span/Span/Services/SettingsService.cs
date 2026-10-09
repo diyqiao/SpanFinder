@@ -1,5 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Text.Json;
 using Windows.Storage;
 
 namespace Span.Services;
@@ -11,7 +13,11 @@ namespace Span.Services;
 /// </summary>
 public class SettingsService : ISettingsService
 {
-    private readonly ApplicationDataContainer _localSettings;
+    private readonly ApplicationDataContainer? _localSettings;
+    private readonly Dictionary<string, object?> _fallbackSettings = new();
+    private static readonly string SettingsFilePath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "Span", "settings.json");
 
     public event Action<string, object?>? SettingChanged;
 
@@ -39,72 +45,116 @@ public class SettingsService : ISettingsService
         }
         catch (Exception ex)
         {
-            Helpers.DebugLogger.Log($"[SettingsService] LocalSettings corrupted, attempting selective recovery: {ex.Message}");
-            try
-            {
-                _localSettings = ApplicationData.Current.LocalSettings;
+            _localSettings = null;
+            LoadFallbackSettings();
+        }
+    }
 
-                // v1.5.2 (Discussion #30): 핵심 키 백업 → Clear → 복원.
-                // 이전 동작은 Wipe 후 모든 사용자 설정(온보딩 완료 플래그 포함)을 잃어
-                // 다음 실행에서 OnboardingCompleted=false → 온보딩 무한 재표시 유발.
-                var preserved = new Dictionary<string, object?>();
-                foreach (var key in _criticalKeysToPreserve)
+    private void LoadFallbackSettings()
+    {
+        try
+        {
+            if (File.Exists(SettingsFilePath))
+            {
+                var json = File.ReadAllText(SettingsFilePath);
+                var dict = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(json);
+                if (dict != null)
                 {
-                    try
+                    foreach (var kvp in dict)
                     {
-                        if (_localSettings.Values.TryGetValue(key, out var v) && v != null)
-                            preserved[key] = v;
+                        _fallbackSettings[kvp.Key] = kvp.Value.ValueKind switch
+                        {
+                            JsonValueKind.True => true,
+                            JsonValueKind.False => false,
+                            JsonValueKind.Number => kvp.Value.TryGetInt32(out var i) ? i : (kvp.Value.TryGetDouble(out var d) ? d : (object)kvp.Value.GetRawText()),
+                            JsonValueKind.String => kvp.Value.GetString(),
+                            _ => kvp.Value.GetRawText()
+                        };
                     }
-                    catch { /* 키 read 실패 — 해당 키만 건너뜀 */ }
                 }
-
-                _localSettings.Values.Clear();
-
-                foreach (var kvp in preserved)
-                {
-                    try { _localSettings.Values[kvp.Key] = kvp.Value; } catch { }
-                }
-                Helpers.DebugLogger.Log($"[SettingsService] Restored {preserved.Count}/{_criticalKeysToPreserve.Length} critical keys after wipe");
-            }
-            catch (Exception innerEx)
-            {
-                // Last resort — settings will be empty but app won't crash
-                Helpers.DebugLogger.Log($"[SettingsService] Selective recovery failed: {innerEx.Message}");
             }
         }
+        catch { }
+    }
+
+    private void SaveFallbackSettings()
+    {
+        try
+        {
+            var dir = Path.GetDirectoryName(SettingsFilePath);
+            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+            {
+                Directory.CreateDirectory(dir);
+            }
+            var json = JsonSerializer.Serialize(_fallbackSettings, new JsonSerializerOptions { WriteIndented = true });
+            File.WriteAllText(SettingsFilePath, json);
+        }
+        catch { }
     }
 
     // ── Generic Get/Set ──
 
     public T Get<T>(string key, T defaultValue)
     {
-        try
+        if (_localSettings != null)
         {
-            if (_localSettings.Values.TryGetValue(key, out var value) && value is T typed)
-                return typed;
+            try
+            {
+                if (_localSettings.Values.TryGetValue(key, out var value) && value is T typed)
+                    return typed;
+            }
+            catch (Exception ex)
+            {
+                try { _localSettings.Values.Remove(key); } catch { }
+            }
         }
-        catch (Exception ex)
+        else
         {
-            Helpers.DebugLogger.Log($"[SettingsService] Error reading '{key}': {ex.Message}");
-            // Remove corrupted key
-            try { _localSettings.Values.Remove(key); } catch { }
+            lock (_fallbackSettings)
+            {
+                if (_fallbackSettings.TryGetValue(key, out var value))
+                {
+                    if (value is T typed) return typed;
+                    try
+                    {
+                        if (value is IConvertible)
+                            return (T)Convert.ChangeType(value, typeof(T));
+                    }
+                    catch { }
+                }
+            }
         }
         return defaultValue;
     }
 
     public void Set<T>(string key, T value)
     {
-        try
+        if (_localSettings != null)
         {
-            var old = _localSettings.Values.ContainsKey(key) ? _localSettings.Values[key] : null;
-            _localSettings.Values[key] = value;
+            try
+            {
+                var old = _localSettings.Values.ContainsKey(key) ? _localSettings.Values[key] : null;
+                _localSettings.Values[key] = value;
 
-            if (!Equals(old, value))
-                SettingChanged?.Invoke(key, value);
+                if (!Equals(old, value))
+                    SettingChanged?.Invoke(key, value);
+            }
+            catch (Exception ex)
+            {
+                Helpers.DebugLogger.Log($"[SettingsService] Error writing '{key}': {ex.Message}");
+            }
         }
-        catch (Exception ex)
+        else
         {
-            Helpers.DebugLogger.Log($"[SettingsService] Error writing '{key}': {ex.Message}");
+            lock (_fallbackSettings)
+            {
+                var old = _fallbackSettings.ContainsKey(key) ? _fallbackSettings[key] : null;
+                _fallbackSettings[key] = value;
+                SaveFallbackSettings();
+
+                if (!Equals(old, value))
+                    SettingChanged?.Invoke(key, value);
+            }
         }
     }
 

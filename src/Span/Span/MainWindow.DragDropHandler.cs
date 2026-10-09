@@ -182,8 +182,7 @@ namespace Span
         /// </summary>
         private void OnFavoritesDragOver(object sender, DragEventArgs e)
         {
-            if (e.DataView.Contains(StandardDataFormats.Text) ||
-                e.DataView.Contains(StandardDataFormats.StorageItems))
+            if (Helpers.Win32DragDropHelper.HasDroppableData(e.DataView))
             {
                 e.AcceptedOperation = DataPackageOperation.Link;
                 e.DragUIOverride.IsCaptionVisible = false;
@@ -253,9 +252,7 @@ namespace Span
             }
 
             // Check if data contains paths (internal or external app)
-            if (!e.DataView.Contains(StandardDataFormats.Text) &&
-                !e.DataView.Properties.ContainsKey("SourcePaths") &&
-                !e.DataView.Contains(StandardDataFormats.StorageItems)) return;
+            if (!Helpers.Win32DragDropHelper.HasDroppableData(e.DataView)) return;
 
             // Prevent dropping onto self (check source paths)
             if (e.DataView.Properties.TryGetValue("SourcePaths", out var srcObj) && srcObj is List<string> srcPaths)
@@ -439,9 +436,7 @@ namespace Span
                 return;
             }
 
-            if (!e.DataView.Contains(StandardDataFormats.Text) &&
-                !e.DataView.Properties.ContainsKey("SourcePaths") &&
-                !e.DataView.Contains(StandardDataFormats.StorageItems)) return;
+            if (!Helpers.Win32DragDropHelper.HasDroppableData(e.DataView)) return;
 
             // Same-folder check: block Move only when source and target are in the SAME pane.
             // Cross-pane drags (Split View) should always be allowed even if the column shows
@@ -515,9 +510,18 @@ namespace Span
         /// <summary>
         /// 드롭 이벤트에서 파일 경로 목록을 추출한다.
         /// 내부 Span 드래그(SourcePaths)와 외부 앱 StorageItems를 모두 지원한다.
+        /// Issue #73: WeChat 4.x 등이 주는 지연 렌더링 CF_HDROP은 WinRT StorageItems로
+        /// 매핑되지 않으므로, 마지막에 OLE 라이브 드래그 객체에서 직접 읽는 폴백을 둔다.
         /// </summary>
         internal async Task<List<string>> ExtractDropPaths(DragEventArgs e)
         {
+            try
+            {
+                var fmts = e.DataView.AvailableFormats;
+                Helpers.DebugLogger.Log($"[DragDrop] ExtractDropPaths called, formats: {(fmts != null ? string.Join(", ", fmts) : "null")}");
+            }
+            catch { }
+
             if (e.DataView.Properties.TryGetValue("SourcePaths", out var srcObj) && srcObj is List<string> srcPaths)
                 return srcPaths;
 
@@ -531,11 +535,48 @@ namespace Span
             // 외부 앱(Windows 탐색기 등)에서 드래그된 StorageItems 처리
             if (e.DataView.Contains(StandardDataFormats.StorageItems))
             {
-                var items = await e.DataView.GetStorageItemsAsync();
-                return items.Select(i => i.Path).Where(p => !string.IsNullOrEmpty(p)).ToList();
+                try
+                {
+                    var items = await e.DataView.GetStorageItemsAsync();
+                    var paths = items.Select(i => i.Path).Where(p => !string.IsNullOrEmpty(p)).ToList();
+                    if (paths.Count > 0) return paths;
+                }
+                catch (Exception ex)
+                {
+                    // 압축 폴더 내부·placeholder 등이 섞이면 통째로 실패한다 — 폴백으로 계속.
+                    Helpers.DebugLogger.Log($"[DragDrop] GetStorageItemsAsync failed: {ex.Message}");
+                }
+            }
+
+            // Issue #73: WinUI3가 매핑하지 못하는 외부 앱 포맷(WeChat 4.x, OLE CF_HDROP 등) 폴백.
+            try
+            {
+                var externalPaths = await Helpers.Win32DragDropHelper.ExtractExternalPathsAsync(e.DataView, GetDropTargetHwnd());
+                if (externalPaths != null && externalPaths.Count > 0)
+                {
+                    Helpers.DebugLogger.Log($"[DragDrop] External paths extracted: {externalPaths.Count} item(s)");
+                    return externalPaths;
+                }
+            }
+            catch (Exception ex)
+            {
+                Helpers.DebugLogger.Log($"[DragDrop] External extract error: {ex.Message}");
             }
 
             return new List<string>();
+        }
+
+        /// <summary>
+        /// Issue #73: 현재 창(드롭 타깃)의 최상위 HWND를 얻는다.
+        /// </summary>
+        private IntPtr GetDropTargetHwnd()
+        {
+            try
+            {
+                var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
+                return hwnd;
+            }
+            catch { return IntPtr.Zero; }
         }
 
         /// <summary>
@@ -868,6 +909,70 @@ namespace Span
         }
 
         /// <summary>
+        /// Callback from the native OLE drop target (Helpers.Win32DropTarget).
+        /// WeChat 4.x drags bypass the XAML pipeline entirely, so this is where their
+        /// CF_HDROP/RWTemp file paths enter the normal drop flow. Drops into the target
+        /// explorer's current folder (respecting Left/Right pane in Split View), always
+        /// as Copy (WeChat temp files must be copied, never moved).
+        /// </summary>
+        private void OnNativeExternalDrop(List<string> paths, int screenX, int screenY)
+        {
+            if (_isClosed || paths == null || paths.Count == 0) return;
+
+            Helpers.DebugLogger.Log($"[NativeDrop] received {paths.Count} path(s) at ({screenX},{screenY}): {string.Join(" | ", paths.Take(8))}");
+
+            DispatcherQueue.TryEnqueue(async () =>
+            {
+                try
+                {
+                    if (_isClosed) return;
+
+                    string destFolder = "";
+
+                    // If split view is open, determine which pane was dropped on using screen coordinates
+                    if (ViewModel?.IsSplitViewEnabled == true && RightPaneContainer != null && RightPaneContainer.ActualWidth > 0)
+                    {
+                        try
+                        {
+                            var transform = RightPaneContainer.TransformToVisual(null);
+                            var rightTopLeft = transform.TransformPoint(new Windows.Foundation.Point(0, 0));
+
+                            var clientPoint = new Helpers.NativeMethods.POINT { X = screenX, Y = screenY };
+                            Helpers.NativeMethods.ScreenToClient(_hwnd, ref clientPoint);
+
+                            if (clientPoint.X >= rightTopLeft.X)
+                            {
+                                destFolder = ViewModel.RightExplorer?.CurrentFolder?.Path ?? "";
+                            }
+                            else
+                            {
+                                destFolder = ViewModel.LeftExplorer?.CurrentFolder?.Path ?? "";
+                            }
+                        }
+                        catch { }
+                    }
+
+                    if (string.IsNullOrEmpty(destFolder))
+                    {
+                        destFolder = ViewModel?.ActiveExplorer?.CurrentFolder?.Path ?? "";
+                    }
+
+                    if (string.IsNullOrEmpty(destFolder) || Helpers.ArchivePathHelper.IsArchivePath(destFolder))
+                    {
+                        Helpers.DebugLogger.Log("[NativeDrop] no valid destination folder — drop ignored");
+                        return;
+                    }
+
+                    await HandleDropAsync(paths, destFolder, DragDropMode.Copy);
+                }
+                catch (Exception ex)
+                {
+                    Helpers.DebugLogger.Log($"[NativeDrop] OnNativeExternalDrop error: {ex.Message}");
+                }
+            });
+        }
+
+        /// <summary>
         /// 드롭 작업을 실제로 실행한다.
         /// 충돌 처리 대화상자 표시, 파일 작업 실행, 대상 컬럼 리로드를 처리한다.
         /// </summary>
@@ -897,6 +1002,12 @@ namespace Span
                     Helpers.DebugLogger.Log("[DragDrop] archive entries could not be staged — drop ignored");
                     return;
                 }
+                mode = DragDropMode.Copy;
+            }
+
+            // WeChat RWTemp files should always be copied, not moved (to prevent corrupting chat cache)
+            if (sourcePaths.Any(p => p.Contains("RWTemp", StringComparison.OrdinalIgnoreCase) || p.Contains("xwechat_files", StringComparison.OrdinalIgnoreCase)))
+            {
                 mode = DragDropMode.Copy;
             }
 
@@ -1219,19 +1330,62 @@ namespace Span
         }
 
         /// <summary>
-        /// Miller 컬럼 ScrollViewer 빈 영역 드래그 — Handled 처리하여 PaneDragOver 버블링 차단.
-        /// 컬럼 뒤 빈 공간에서 DropOverlay가 뜨는 문제 방지.
+        /// Miller 컬럼 ScrollViewer 빈 영역 드래그 — 현재 활성 폴더로 드롭을 허용한다.
         /// </summary>
         private void OnMillerEmptyAreaDragOver(object sender, DragEventArgs e)
         {
-            // 컬럼 ListView가 이미 Handled 한 경우는 여기 안 옴
-            // 빈 영역이므로 드롭 불가로 표시하고 버블링만 차단 (DropOverlay 방지)
-            e.AcceptedOperation = DataPackageOperation.None;
-            e.Handled = true;
-            HideDragTooltip();
-
-            // Shelf 자동 표시는 유지해야 함 (OnPaneDragOver 버블링 차단되므로 여기서 직접 호출)
             ShowShelfForDrag();
+
+            if (!Helpers.Win32DragDropHelper.HasDroppableData(e.DataView))
+            {
+                e.AcceptedOperation = DataPackageOperation.None;
+                e.Handled = true;
+                HideDragTooltip();
+                return;
+            }
+
+            var activeExp = ViewModel.ActiveExplorer;
+            var destFolder = activeExp?.CurrentFolder?.Path ?? "";
+            if (string.IsNullOrEmpty(destFolder) || Helpers.ArchivePathHelper.IsArchivePath(destFolder))
+            {
+                e.AcceptedOperation = DataPackageOperation.None;
+                e.Handled = true;
+                HideDragTooltip();
+                return;
+            }
+
+            var mode = ResolveDragDropMode(e, destFolder);
+            e.AcceptedOperation = ToAcceptedOperation(mode);
+            e.DragUIOverride.IsCaptionVisible = false;
+            e.DragUIOverride.IsGlyphVisible = false;
+            UpdateDragTooltip(GetDragCaption(mode, activeExp?.CurrentFolder?.Name ?? ""), e, sender as UIElement ?? (UIElement)Content);
+            e.Handled = true;
+        }
+
+        /// <summary>
+        /// Miller 컬럼 빈 영역 드롭 시 현재 활성 폴더로 파일 작업(복사/이동)을 실행한다.
+        /// </summary>
+        private async void OnMillerEmptyAreaDrop(object sender, DragEventArgs e)
+        {
+            HideDragTooltip();
+            try
+            {
+                var activeExp = ViewModel.ActiveExplorer;
+                var destFolder = activeExp?.CurrentFolder?.Path ?? "";
+                if (string.IsNullOrEmpty(destFolder) || Helpers.ArchivePathHelper.IsArchivePath(destFolder))
+                    return;
+
+                var paths = await ExtractDropPaths(e);
+                if (paths.Count == 0) return;
+
+                var mode = ResolveDragDropMode(e, destFolder);
+                await HandleDropAsync(paths, destFolder, mode);
+                e.Handled = true;
+            }
+            catch (Exception ex)
+            {
+                Helpers.DebugLogger.Log($"[DragDrop] OnMillerEmptyAreaDrop error: {ex.Message}");
+            }
         }
 
         private void OnMillerEmptyAreaDragLeave(object sender, DragEventArgs e)
@@ -1687,9 +1841,7 @@ namespace Span
                 return;
             }
 
-            if (!e.DataView.Contains(StandardDataFormats.Text) &&
-                !e.DataView.Properties.ContainsKey("SourcePaths") &&
-                !e.DataView.Contains(StandardDataFormats.StorageItems)) return;
+            if (!Helpers.Win32DragDropHelper.HasDroppableData(e.DataView)) return;
 
             bool isSameFolder = false;
             bool isCrossPane = false;
@@ -1756,9 +1908,7 @@ namespace Span
                 return;
             }
 
-            if (!e.DataView.Contains(StandardDataFormats.Text) &&
-                !e.DataView.Properties.ContainsKey("SourcePaths") &&
-                !e.DataView.Contains(StandardDataFormats.StorageItems)) return;
+            if (!Helpers.Win32DragDropHelper.HasDroppableData(e.DataView)) return;
 
             // Self-drop check: 대상 폴더 자체를 대상으로 드롭 차단
             if (e.DataView.Properties.TryGetValue("SourcePaths", out var srcObj) && srcObj is List<string> srcPaths)

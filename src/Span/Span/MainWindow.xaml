@@ -942,6 +942,7 @@
                                               VerticalScrollMode="Disabled"
                                               AllowDrop="True"
                                               DragOver="OnMillerEmptyAreaDragOver"
+                                              Drop="OnMillerEmptyAreaDrop"
                                               DragLeave="OnMillerEmptyAreaDragLeave"
                                               >
                                     <StackPanel Orientation="Horizontal">
@@ -1387,6 +1388,7 @@
                                           Visibility="{x:Bind IsMillerColumnsMode(ViewModel.RightViewMode), Mode=OneWay}"
                                           AllowDrop="True"
                                           DragOver="OnMillerEmptyAreaDragOver"
+                                          Drop="OnMillerEmptyAreaDrop"
                                           DragLeave="OnMillerEmptyAreaDragLeave">
                                 <!-- v1.4.19: ItemsControl을 StackPanel로 감싸 spacer Border와 함께 배치 (좌측과 동일 패턴) -->
                                 <StackPanel Orientation="Horizontal">

@@ -720,8 +720,7 @@ namespace Span
         {
             _isDragOverShelf = true;
 
-            if (e.DataView.Contains(StandardDataFormats.Text) ||
-                e.DataView.Contains(StandardDataFormats.StorageItems))
+            if (Helpers.Win32DragDropHelper.HasDroppableData(e.DataView))
             {
                 e.AcceptedOperation = DataPackageOperation.Copy;
                 ShelfPanel.BorderBrush = GetThemeBrush("SpanAccentBrush");
@@ -755,6 +754,16 @@ namespace Span
                 {
                     var items = await e.DataView.GetStorageItemsAsync();
                     paths = items.Select(i => i.Path).Where(p => !string.IsNullOrEmpty(p)).ToList();
+                }
+
+                if (paths == null || paths.Count == 0)
+                {
+                    try
+                    {
+                        var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
+                        paths = await Helpers.Win32DragDropHelper.ExtractExternalPathsAsync(e.DataView, hwnd);
+                    }
+                    catch { }
                 }
 
                 if (paths != null && paths.Count > 0)

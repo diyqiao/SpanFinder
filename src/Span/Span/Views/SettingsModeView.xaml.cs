@@ -57,8 +57,15 @@ public sealed partial class SettingsModeView : UserControl
         this.InitializeComponent();
 
         // Set version from Package manifest + auto-generated build date
-        var v = Windows.ApplicationModel.Package.Current.Id.Version;
-        VersionLabel.Text = $"v{v.Major}.{v.Minor}.{v.Build} (Build {BuildInfo.BuildDate})";
+        try
+        {
+            var v = Windows.ApplicationModel.Package.Current.Id.Version;
+            VersionLabel.Text = $"v{v.Major}.{v.Minor}.{v.Build} (Build {BuildInfo.BuildDate})";
+        }
+        catch
+        {
+            VersionLabel.Text = $"v2.0.7 (Build {BuildInfo.BuildDate})";
+        }
 
         _settings = App.Current.Services.GetRequiredService<Services.SettingsService>();
         _sections = new ScrollViewer[]

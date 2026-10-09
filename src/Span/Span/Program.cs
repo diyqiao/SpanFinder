@@ -27,6 +27,31 @@ class Program
 
         WinRT.ComWrappersSupport.InitializeComWrappers();
 
+        // Kill any conflicting older instances (e.g. Store app in WindowsApps)
+        try
+        {
+            var curPid = System.Diagnostics.Process.GetCurrentProcess().Id;
+            var curExe = Environment.ProcessPath;
+            foreach (var p in System.Diagnostics.Process.GetProcessesByName("Span"))
+            {
+                if (p.Id != curPid)
+                {
+                    try
+                    {
+                        var pPath = p.MainModule?.FileName;
+                        if (!string.Equals(pPath, curExe, StringComparison.OrdinalIgnoreCase) ||
+                            pPath?.Contains("WindowsApps", StringComparison.OrdinalIgnoreCase) == true)
+                        {
+                            p.Kill();
+                            p.WaitForExit(1000);
+                        }
+                    }
+                    catch { }
+                }
+            }
+        }
+        catch { }
+
         var isRedirect = DecideRedirection();
         if (!isRedirect)
         {
